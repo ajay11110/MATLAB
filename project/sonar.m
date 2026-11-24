@@ -1,99 +1,53 @@
 clear; clc; close all;
 
 %% Settings
-Fs = 48000;                 % Sample rate (Hz)
-soundSpeed = 343;           % Approximate speed of sound (m/s)
-recordSeconds = 1.5;         % Total recording time
-chirpSeconds = 0.08;         % Chirp duration
-startFreq = 1500;            % Start frequency (Hz)
-endFreq = 6000;              % End frequency (Hz)
+Fs = 48000; soundSpeed = 343;
+recordSeconds = 1.5; chirpSeconds = 0.08;
+startFreq = 1500; endFreq = 6000;
+minDistance = 0.40; maxDistance = 3.00;
 
-minDistance = 0.40;          % Ignore echoes closer than this (m)
-maxDistance = 3.00;          % Search up to this distance (m)
+%% Generate chirp, record, and play
+t = (0:round(chirpSeconds*Fs)-1)' / Fs;
+tx = sin(2*pi*(startFreq*t + 0.5*((endFreq - startFreq)/chirpSeconds)*t.^2));
 
-%% Create a short rising-frequency chirp
-N = round(chirpSeconds * Fs);
-t = (0:N-1)' / Fs;
-
-sweepRate = (endFreq - startFreq) / chirpSeconds;
-tx = sin(2*pi*(startFreq*t + 0.5*sweepRate*t.^2));
-
-%% Prepare microphone recording and speaker playback
-recorder = audiorecorder(Fs, 16, 1);
+rec = audiorecorder(Fs, 16, 1);
 player = audioplayer(tx, Fs);
 
-% Recording and playing the chirp
-record(recorder);
+record(rec);
 pause(0.15);
 playblocking(player);
 pause(max(0, recordSeconds - chirpSeconds - 0.15));
-stop(recorder);
+stop(rec);
 
-rx = getaudiodata(recorder, 'double');
-rx = rx(:);
+rx = getaudiodata(rec, 'double');
+assert(~isempty(rx) && max(abs(rx)) >= 1e-5, 'No usable microphone signal was recorded. Check microphone permissions and input settings.');
 
-if isempty(rx) || max(abs(rx)) < 0.00001
-    error('No usable microphone signal was recorded. Check microphone permissions and input settings.');
-end
+%% Cross-correlate and find direct + echo peaks
+[corr, lags] = xcorr(rx, tx);
+absCorr = abs(corr);
 
-%% Cross-correlate recording with the transmitted chirp
-[correlation, lags] = xcorr(rx, tx);
+earlyIdx = find(lags >= round(0.08*Fs) & lags <= round(0.45*Fs));
+assert(~isempty(earlyIdx), 'Could not find a valid direct-sound search region.');
+[directPeak, i] = max(absCorr(earlyIdx));
+directLag = lags(earlyIdx(i));
 
-% Find the direct sound near the expected playback start.
-directWindowStart = round(0.08 * Fs);
-directWindowEnd = round(0.45 * Fs);
-earlyIndices = find(lags >= directWindowStart & lags <= directWindowEnd);
+echoIdx = find(lags >= directLag + round((2*minDistance/soundSpeed)*Fs) & lags <= directLag + round((2*maxDistance/soundSpeed)*Fs));
+assert(~isempty(echoIdx), 'Recording is too short for the selected maximum distance.');
+[echoPeak, i] = max(absCorr(echoIdx));
+echoLag = lags(echoIdx(i));
 
-if isempty(earlyIndices)
-    error('Could not find a valid direct-sound search region.');
-end
+%% Calculate and print distance
+echoDelay = (echoLag - directLag) / Fs;
+fprintf('\n--- Sonar estimate ---\nDirect-sound lag: %.2f ms\nLater-peak lag: %.2f ms\nDelay after direct: %.2f ms\nEstimated distance: %.2f m\n', ...
+    1000*directLag/Fs, 1000*echoLag/Fs, 1000*echoDelay, soundSpeed*echoDelay/2);
 
-[directPeak, directLocalIndex] = max(abs(correlation(earlyIndices)));
-directIndex = earlyIndices(directLocalIndex);
-directLag = lags(directIndex);
-
-% Search for a later matching signal within the selected distance range.
-minDelaySamples = round((2 * minDistance / soundSpeed) * Fs);
-maxDelaySamples = round((2 * maxDistance / soundSpeed) * Fs);
-
-echoIndices = find((lags >= directLag + minDelaySamples) & (lags <= directLag + maxDelaySamples));
-
-if isempty(echoIndices)
-    error('Recording is too short for the selected maximum distance.');
-end
-
-[echoPeak, echoLocalIndex] = max(abs(correlation(echoIndices)));
-echoIndex = echoIndices(echoLocalIndex);
-echoLag = lags(echoIndex);
-
-%% Calculate distance relative to the direct-sound timing reference
-delaySamples = echoLag - directLag;
-echoDelay = delaySamples / Fs;
-estimatedDistance = soundSpeed * echoDelay / 2;
-
-fprintf('\n--- Sonar estimate ---\n');
-fprintf('Direct-sound lag: %.2f ms\n', 1000*directLag/Fs);
-fprintf('Later-peak lag: %.2f ms\n', 1000*echoLag/Fs);
-fprintf('Delay after direct: %.2f ms\n', 1000*echoDelay);
-fprintf('Estimated distance: %.2f m\n', estimatedDistance);
-
-%% Plot the recording and correlation
-timeRx = (0:numel(rx)-1)' / Fs;
+%% Plots
+figure;
+plot((0:numel(rx)-1)/Fs, rx); grid on;
+xlabel('Time (seconds)'); ylabel('Microphone amplitude'); title('Microphone recording');
 
 figure;
-plot(timeRx, rx);
-xlabel('Time (seconds)');
-ylabel('Microphone amplitude');
-title('Microphone recording');
-grid on;
-
-figure;
-plot(lags/Fs, abs(correlation));
-hold on;
-plot(directLag/Fs, abs(correlation(directIndex)), 'o');
-plot(echoLag/Fs, abs(correlation(echoIndex)), 'o');
-xlabel('Lag (seconds)');
-ylabel('Absolute correlation');
+plot(lags/Fs, absCorr, directLag/Fs, directPeak, 'o', echoLag/Fs, echoPeak, 'o'); grid on;
+xlabel('Lag (seconds)'); ylabel('Absolute correlation');
 title('Chirp correlation: direct sound and later candidate peak');
 legend('Correlation', 'Direct sound', 'Later candidate');
-grid on;
